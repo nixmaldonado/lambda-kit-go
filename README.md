@@ -165,8 +165,8 @@ Other behavior:
 
 - A record that panics counts as failed; the rest of the batch still runs.
 - If no record succeeds, the handler also returns an error matching `batch.ErrAllFailed`, so Lambda counts a failed invocation and backs off.
-- If the context is cancelled (the invocation is about to time out), the remaining records are reported as failed without being processed.
-- Use `batch.OnError(func(ctx, id, err))` to log failures; the response only carries record IDs.
+- When the invocation gets within 1 second of its timeout, the remaining records are reported as failed without being processed, leaving time to send the response. Change the margin with `batch.WithTimeoutMargin(d)`.
+- Use `batch.OnError(func(ctx, id, err))` to log failures; the response only carries record IDs. It is called for every reported record. Records reported without being processed get an error matching `batch.ErrNotProcessed`.
 
 ### Batch + idempotency
 
@@ -183,6 +183,12 @@ lambda.Start(batch.SQS(func(ctx context.Context, msg events.SQSMessage) error {
 	_, err := idempotency.Do(ctx, idem, o.ID, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, charge(ctx, o)
 	})
+	if errors.Is(err, idempotency.ErrResponseNotSaved) {
+		// The charge happened; only saving the result failed. Reporting the
+		// message as failed would redeliver it and could charge again.
+		slog.ErrorContext(ctx, "charged but not recorded", "order", o.ID, "err", err)
+		return nil
+	}
 	return err
 }))
 ```

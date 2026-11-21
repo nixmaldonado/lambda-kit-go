@@ -3,6 +3,7 @@ package batch_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -32,6 +33,11 @@ func ExampleSQS() {
 
 			return struct{}{}, nil
 		})
+		if errors.Is(err, idempotency.ErrResponseNotSaved) {
+			// The charge happened; don't report the message as failed, or
+			// its redelivery could charge again. Log it instead.
+			return nil
+		}
 
 		return err
 	})

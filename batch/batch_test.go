@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 )
@@ -244,5 +247,142 @@ func TestDynamoDBStopsAndReportsFirstFailure(t *testing.T) {
 	}
 	if len(resp.BatchItemFailures) != 1 || resp.BatchItemFailures[0].ItemIdentifier != "10" {
 		t.Errorf("reported %+v, want only 10", resp.BatchItemFailures)
+	}
+}
+
+func TestStopsBeforeDeadlineMargin(t *testing.T) {
+	start := time.Now()
+	now := start
+	deadline := start.Add(10 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	seen := []string{}
+	var notProcessed []string
+	h := SQS(
+		func(_ context.Context, m events.SQSMessage) error {
+			seen = append(seen, m.Body)
+			now = now.Add(9500 * time.Millisecond) // a slow record leaves 0.5s
+
+			return nil
+		},
+		OnError(func(_ context.Context, id string, err error) {
+			if errors.Is(err, ErrNotProcessed) {
+				notProcessed = append(notProcessed, id)
+			}
+		}),
+		func(c *config) { c.now = func() time.Time { return now } },
+	)
+
+	resp, err := h(ctx, sqsEvent(standardARN, "a", "b", "c"))
+
+	if err != nil {
+		t.Errorf("err = %v, want nil since a succeeded", err)
+	}
+	if !slices.Equal(seen, []string{"a"}) {
+		t.Errorf("processed %v, want [a]", seen)
+	}
+	if got := sqsFailures(resp); !slices.Equal(got, []string{"b", "c"}) {
+		t.Errorf("reported %v, want [b c]", got)
+	}
+	if !slices.Equal(notProcessed, []string{"b", "c"}) {
+		t.Errorf("OnError not-processed calls = %v, want [b c]", notProcessed)
+	}
+}
+
+func TestStreamStopsBeforeDeadlineMarginReportsOne(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(500*time.Millisecond))
+	defer cancel()
+	ran := false
+	h := Kinesis(func(context.Context, events.KinesisEventRecord) error {
+		ran = true
+
+		return nil
+	})
+	ev := events.KinesisEvent{Records: []events.KinesisEventRecord{
+		{Kinesis: events.KinesisRecord{SequenceNumber: "1"}},
+		{Kinesis: events.KinesisRecord{SequenceNumber: "2"}},
+	}}
+
+	resp, err := h(ctx, ev)
+
+	if ran {
+		t.Error("processed a record inside the timeout margin")
+	}
+	if !errors.Is(err, ErrAllFailed) {
+		t.Errorf("err = %v, want ErrAllFailed", err)
+	}
+	if len(resp.BatchItemFailures) != 1 || resp.BatchItemFailures[0].ItemIdentifier != "1" {
+		t.Errorf("reported %+v, want only 1", resp.BatchItemFailures)
+	}
+}
+
+func TestWithTimeoutMarginRejectsNegative(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("WithTimeoutMargin(-1s) did not panic")
+		}
+	}()
+	WithTimeoutMargin(-time.Second)
+}
+
+func TestOnErrorPanicDoesNotCrash(t *testing.T) {
+	seen := []string{}
+	h := SQS(
+		failOn(&seen, "a"),
+		OnError(func(context.Context, string, error) { panic("logger broke") }),
+	)
+
+	resp, err := h(context.Background(), sqsEvent(standardARN, "a", "b"))
+
+	if err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+	if got := sqsFailures(resp); !slices.Equal(got, []string{"a"}) {
+		t.Errorf("reported %v, want [a]", got)
+	}
+}
+
+func TestOnErrorCoversFIFOSkippedRecords(t *testing.T) {
+	calls := map[string]error{}
+	seen := []string{}
+	h := SQS(
+		failOn(&seen, "a"),
+		OnError(func(_ context.Context, id string, err error) { calls[id] = err }),
+	)
+
+	if _, err := h(context.Background(), sqsEvent(fifoARN, "a", "b", "c")); !errors.Is(err, ErrAllFailed) {
+		t.Fatalf("err = %v, want ErrAllFailed", err)
+	}
+
+	if !errors.Is(calls["a"], errBoom) {
+		t.Errorf("OnError(a) = %v, want errBoom", calls["a"])
+	}
+	for _, id := range []string{"b", "c"} {
+		if !errors.Is(calls[id], ErrNotProcessed) {
+			t.Errorf("OnError(%s) = %v, want ErrNotProcessed", id, calls[id])
+		}
+	}
+}
+
+func TestAllFailedErrorIsBounded(t *testing.T) {
+	ids := make([]string, 0, 1000)
+	for i := range 1000 {
+		ids = append(ids, strconv.Itoa(i))
+	}
+	h := SQS(func(context.Context, events.SQSMessage) error { panic("dependency down") })
+
+	resp, err := h(context.Background(), sqsEvent(standardARN, ids...))
+
+	if !errors.Is(err, ErrAllFailed) {
+		t.Fatalf("err = %v, want ErrAllFailed", err)
+	}
+	if len(resp.BatchItemFailures) != 1000 {
+		t.Errorf("reported %d failures, want 1000", len(resp.BatchItemFailures))
+	}
+	if !strings.Contains(err.Error(), "(and 997 more)") {
+		t.Errorf("error does not summarize omitted records")
+	}
+	if n := len(err.Error()); n > 64<<10 {
+		t.Errorf("error is %d bytes, want a bounded size", n)
 	}
 }
