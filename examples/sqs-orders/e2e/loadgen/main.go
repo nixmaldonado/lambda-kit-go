@@ -38,7 +38,7 @@ func main() {
 	raceOrders := flag.Int("race-orders", 50, "orders sent 5 times at the same instant")
 	poison := flag.Int("poison", 20, "invalid messages that must end up in the DLQ")
 	slow := flag.Int("slow", 5, "orders that sleep close to the function timeout")
-	slowMs := flag.Int("slow-ms", 9300, "how long slow orders sleep; the function timeout is 10s")
+	slowMs := flag.Int("slow-ms", 6000, "how long slow orders sleep; with 2s of headroom they need 8s of a 10s timeout")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -52,13 +52,8 @@ func main() {
 	}
 	client := sqs.NewFromConfig(cfg)
 
-	dlqBaseline, err := e2e.QueueDepth(ctx, client, out.DLQURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	run := "r" + strconv.FormatInt(time.Now().Unix(), 36)
-	m := e2e.Manifest{Run: run, Poison: *poison, DLQBaseline: dlqBaseline, SentAt: time.Now()}
+	m := e2e.Manifest{Run: run, Poison: *poison, SentAt: time.Now()}
 	bodies := []string{}
 	n := 0
 	newOrder := func(delayMs int) order {
@@ -89,7 +84,8 @@ func main() {
 		add(newOrder(*slowMs), 2)
 	}
 	for i := range *poison {
-		bodies = append(bodies, fmt.Sprintf("not json {%d", i))
+		// The run ID lets verify count this run's poison in the DLQ.
+		bodies = append(bodies, fmt.Sprintf("%s%s-%d", e2e.PoisonPrefix, run, i))
 	}
 	rand.Shuffle(len(bodies), func(i, j int) { bodies[i], bodies[j] = bodies[j], bodies[i] })
 

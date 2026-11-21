@@ -28,7 +28,7 @@ import (
 func main() {
 	outputsPath := flag.String("outputs", "build/outputs.json", "terraform output -json file")
 	manifestPath := flag.String("manifest", "build/manifest.json", "manifest written by loadgen")
-	timeout := flag.Duration("timeout", 10*time.Minute, "how long to wait for the queue to drain")
+	timeout := flag.Duration("timeout", 15*time.Minute, "how long to wait for the queue to drain")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -46,7 +46,7 @@ func main() {
 	}
 	sqsClient := sqs.NewFromConfig(cfg)
 
-	if err := waitForDrain(ctx, sqsClient, out, m, *timeout); err != nil {
+	if err := waitForDrain(ctx, sqsClient, out.QueueURL, *timeout); err != nil {
 		log.Fatal(err)
 	}
 
@@ -54,7 +54,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	inDLQ, err := validOrdersInDLQ(ctx, sqsClient, out.DLQURL, m.Run)
+	dlq, err := readDLQ(ctx, sqsClient, out.DLQURL, m.Run)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -65,14 +65,16 @@ func main() {
 		"record not processed",     // ErrNotProcessed: the timeout margin handed records back
 		"AccessDenied",             // a missing IAM permission
 		"charged but not recorded", // ErrResponseNotSaved
-		"Task timed out",           // an invocation hit the hard timeout
+		"not enough time left",     // the example's headroom guard deferred a charge
+		"Task timed out",           // a hard timeout, older log format
+		"Status: timeout",          // a hard timeout, REPORT line format
 	} {
 		if counts[phrase], err = countLogLines(ctx, logs, out.LogGroup, phrase, m.SentAt); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	if !report(m, charges, inDLQ, counts) {
+	if !report(m, charges, dlq, counts) {
 		os.Exit(1)
 	}
 }
@@ -90,11 +92,11 @@ func loadManifest(path string) (e2e.Manifest, error) {
 	return m, nil
 }
 
-// waitForDrain waits until the queue is empty and the DLQ holds the poison
-// messages, three polls in a row, since SQS counts are approximate.
-func waitForDrain(ctx context.Context, client *sqs.Client, out e2e.Outputs, m e2e.Manifest, timeout time.Duration) error {
+// waitForDrain waits until the main queue is empty three polls in a row,
+// since SQS counts are approximate. Once it is, every message was either
+// processed or moved to the DLQ.
+func waitForDrain(ctx context.Context, client *sqs.Client, queueURL string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	wantDLQ := m.DLQBaseline + m.Poison
 	stable := 0
 
 	for stable < 3 {
@@ -102,17 +104,13 @@ func waitForDrain(ctx context.Context, client *sqs.Client, out e2e.Outputs, m e2
 			return fmt.Errorf("queue did not drain within %v", timeout)
 		}
 
-		depth, err := e2e.QueueDepth(ctx, client, out.QueueURL)
+		depth, err := e2e.QueueDepth(ctx, client, queueURL)
 		if err != nil {
 			return err
 		}
-		dlq, err := e2e.QueueDepth(ctx, client, out.DLQURL)
-		if err != nil {
-			return err
-		}
-		log.Printf("queue: %d in flight, DLQ: %d (want %d)", depth, dlq, wantDLQ)
+		log.Printf("queue: %d visible or in flight", depth)
 
-		if depth == 0 && dlq >= wantDLQ {
+		if depth == 0 {
 			stable++
 		} else {
 			stable = 0
@@ -154,34 +152,53 @@ func scanLedger(ctx context.Context, client *dynamodb.Client, table, run string)
 	return charges, nil
 }
 
-// validOrdersInDLQ returns this run's valid orders that ended up in the DLQ,
-// which should be none. It reads the DLQ without deleting anything.
-func validOrdersInDLQ(ctx context.Context, client *sqs.Client, dlqURL, run string) ([]string, error) {
-	found := []string{}
-	for range 100 {
+// dlqContents is what this run left in the DLQ.
+type dlqContents struct {
+	poison int      // this run's invalid messages
+	valid  []string // this run's valid orders, which should be none
+}
+
+// readDLQ reads the whole DLQ without deleting anything and picks out this
+// run's messages. Each message read is hidden for 10 minutes, so it is not
+// counted twice; it stops after several empty receives in a row.
+func readDLQ(ctx context.Context, client *sqs.Client, dlqURL, run string) (dlqContents, error) {
+	c := dlqContents{valid: []string{}}
+	poisonPrefix := e2e.PoisonPrefix + run + "-"
+
+	for empty := 0; empty < 3; {
 		res, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(dlqURL),
 			MaxNumberOfMessages: 10,
-			VisibilityTimeout:   120,
-			WaitTimeSeconds:     1,
+			VisibilityTimeout:   600,
+			WaitTimeSeconds:     5,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("reading DLQ: %w", err)
+			return c, fmt.Errorf("reading DLQ: %w", err)
 		}
 		if len(res.Messages) == 0 {
-			break
+			empty++
+
+			continue
 		}
+		empty = 0
+
 		for _, msg := range res.Messages {
+			body := aws.ToString(msg.Body)
+			if strings.HasPrefix(body, poisonPrefix) {
+				c.poison++
+
+				continue
+			}
 			var o struct {
 				ID string `json:"id"`
 			}
-			if json.Unmarshal([]byte(aws.ToString(msg.Body)), &o) == nil && strings.HasPrefix(o.ID, run+"-") {
-				found = append(found, o.ID)
+			if json.Unmarshal([]byte(body), &o) == nil && strings.HasPrefix(o.ID, run+"-") {
+				c.valid = append(c.valid, o.ID)
 			}
 		}
 	}
 
-	return found, nil
+	return c, nil
 }
 
 func countLogLines(ctx context.Context, client *cloudwatchlogs.Client, group, phrase string, since time.Time) (int, error) {
@@ -203,7 +220,7 @@ func countLogLines(ctx context.Context, client *cloudwatchlogs.Client, group, ph
 }
 
 // report prints the results and returns whether the run passed.
-func report(m e2e.Manifest, charges map[string]int, inDLQ []string, counts map[string]int) bool {
+func report(m e2e.Manifest, charges map[string]int, dlq dlqContents, counts map[string]int) bool {
 	missing, doubled := []string{}, []string{}
 	for _, id := range m.Orders {
 		switch n := charges[id]; {
@@ -226,13 +243,15 @@ func report(m e2e.Manifest, charges map[string]int, inDLQ []string, counts map[s
 
 	check(len(doubled) == 0, "no order charged twice (%d doubled) %s", len(doubled), sample(doubled))
 	check(len(missing) == 0, "every order charged (%d missing) %s", len(missing), sample(missing))
-	check(len(inDLQ) == 0, "no valid order in the DLQ (%d found) %s", len(inDLQ), sample(inDLQ))
+	check(len(dlq.valid) == 0, "no valid order in the DLQ (%d found) %s", len(dlq.valid), sample(dlq.valid))
+	check(dlq.poison == m.Poison, "every invalid message reached the DLQ (%d of %d)", dlq.poison, m.Poison)
 	check(counts["AccessDenied"] == 0, "IAM permissions sufficient (%d AccessDenied lines)", counts["AccessDenied"])
 
 	fmt.Println("\n  Evidence the interesting paths ran:")
 	fmt.Printf("    concurrent duplicates blocked (ErrInProgress):  %d\n", counts["already in progress"])
+	fmt.Printf("    charges deferred by the headroom guard:         %d\n", counts["not enough time left"])
 	fmt.Printf("    records handed back near timeout:               %d\n", counts["record not processed"])
-	fmt.Printf("    invocations that hit the hard timeout:          %d\n", counts["Task timed out"])
+	fmt.Printf("    invocations that hit the hard timeout:          %d\n", counts["Task timed out"]+counts["Status: timeout"])
 	fmt.Printf("    charged but not recorded:                       %d\n", counts["charged but not recorded"])
 	fmt.Println()
 

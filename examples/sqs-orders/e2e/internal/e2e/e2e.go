@@ -64,11 +64,12 @@ type Manifest struct {
 	// Messages is how many messages were sent, duplicates and poison included.
 	Messages int `json:"messages"`
 	// Poison is how many invalid messages were sent.
-	Poison int `json:"poison"`
-	// DLQBaseline is the DLQ depth before the run.
-	DLQBaseline int       `json:"dlqBaseline"`
-	SentAt      time.Time `json:"sentAt"`
+	Poison int       `json:"poison"`
+	SentAt time.Time `json:"sentAt"`
 }
+
+// PoisonPrefix starts every invalid message body, followed by the run ID.
+const PoisonPrefix = "not json {"
 
 // WriteJSON writes v to path as indented JSON.
 func WriteJSON(path string, v any) error {

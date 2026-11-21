@@ -1,8 +1,9 @@
 locals {
-  # Lambda requires the queue's visibility timeout to be at least the
-  # function timeout.
-  function_timeout   = 10
-  visibility_timeout = 20
+  function_timeout = 10
+  # AWS recommends at least 6x the function timeout for Lambda SQS sources,
+  # so messages waiting for a throttled invocation don't time out and burn
+  # a receive.
+  visibility_timeout = 60
 }
 
 data "archive_file" "function" {
@@ -23,10 +24,12 @@ resource "aws_sqs_queue" "orders" {
   visibility_timeout_seconds = local.visibility_timeout
   message_retention_seconds  = 86400
 
-  # A message that fails 3 receives (e.g. invalid JSON) goes to the DLQ.
+  # A message that fails 5 receives (e.g. invalid JSON) goes to the DLQ.
+  # At least 5, as AWS recommends: ErrInProgress retries and throttling also
+  # use up receives, and a valid order must not reach the DLQ that way.
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = 5
   })
 }
 

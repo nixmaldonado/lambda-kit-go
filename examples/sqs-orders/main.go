@@ -27,6 +27,16 @@ import (
 	"github.com/nixmaldonado/lambda-kit-go/idempotency/dynamodbstore"
 )
 
+// chargeHeadroom is the time that must be left, on top of the work itself,
+// to make the charge and save its result before the Lambda deadline. Without
+// it, a charge could start so late that it happens but is never recorded,
+// and the retry would charge again.
+const chargeHeadroom = 2 * time.Second
+
+// errNotEnoughTime is returned before charging when the invocation is too
+// close to its deadline. The message is retried in a fresh invocation.
+var errNotEnoughTime = errors.New("not enough time left to charge safely")
+
 // Order is the message body.
 type Order struct {
 	ID     string `json:"id"`
@@ -85,7 +95,10 @@ func (a *app) process(ctx context.Context, msg events.SQSMessage) error {
 	})
 	if errors.Is(err, idempotency.ErrResponseNotSaved) {
 		// The charge happened; only saving the result failed. Reporting the
-		// message as failed would redeliver it and could charge again.
+		// message as failed would redeliver it and charge again. This is not
+		// a full guarantee: the record stays in progress only until this
+		// invocation's deadline, so a producer duplicate arriving after
+		// that would still be charged. Alert on this log line.
 		slog.ErrorContext(ctx, "charged but not recorded", "order", o.ID, "err", err)
 
 		return nil
@@ -98,6 +111,12 @@ func (a *app) process(ctx context.Context, msg events.SQSMessage) error {
 // ledger table, which is deliberately not idempotent: a double charge shows
 // up as charges = 2.
 func (a *app) charge(ctx context.Context, o Order) error {
+	// Don't start an irreversible step without time to finish and record it.
+	work := time.Duration(o.DelayMs) * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < work+chargeHeadroom {
+		return errNotEnoughTime
+	}
+
 	if o.DelayMs > 0 {
 		select {
 		case <-time.After(time.Duration(o.DelayMs) * time.Millisecond):

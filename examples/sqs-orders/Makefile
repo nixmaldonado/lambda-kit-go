@@ -19,7 +19,7 @@ test:
 	go run ./e2e/loadgen
 	go run ./e2e/verify
 
-destroy:
+destroy: build
 	$(TF) destroy -input=false -auto-approve
 	$(MAKE) leftovers
 

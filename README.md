@@ -94,6 +94,8 @@ lambda.Start(func(ctx context.Context, o Order) (Receipt, error) {
 })
 ```
 
+This stops the immediate retry, but it isn't a full guarantee. The record stays `INPROGRESS` only until the invocation's deadline, so a separate duplicate of the same event arriving after that runs the handler again. The library can't close this gap, because the store is the thing that failed. Alert on that log line, and pass an idempotency key to downstream APIs that accept one, so they deduplicate too.
+
 ### Options
 
 | Option | Purpose |
