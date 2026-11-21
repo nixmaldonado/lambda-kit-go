@@ -23,3 +23,22 @@ jobs:
       - run: go test -race ./...
         env:
           LAMBDAKIT_DYNAMODB_ENDPOINT: http://localhost:8000
+
+  # Builds the example and validates its Terraform. Nothing is deployed.
+  example:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/sqs-orders
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/sqs-orders/go.mod
+          cache-dependency-path: examples/sqs-orders/go.sum
+      - run: go vet ./...
+      - run: make build
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=terraform fmt -check -recursive
+      - run: terraform -chdir=terraform init -backend=false -input=false
+      - run: terraform -chdir=terraform validate

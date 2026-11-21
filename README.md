@@ -11,6 +11,8 @@ This is a community project. It is not affiliated with or endorsed by AWS.
 | [`idempotency`](./idempotency) | Makes handlers safe to retry: repeated events return the saved response instead of running again. |
 | [`batch`](./batch) | Processes SQS, Kinesis and DynamoDB Streams batches record by record and reports partial failures, so only failed records are retried. |
 
+**Example:** [`examples/sqs-orders`](./examples/sqs-orders) is a complete, deployable SQS → Lambda → DynamoDB project (Terraform included) that charges each order at most once. It doubles as the end-to-end test against real AWS.
+
 ## Idempotency
 
 ```sh
