@@ -11,6 +11,8 @@ This is a community project. It is not affiliated with or endorsed by AWS.
 | [`idempotency`](./idempotency) | Makes handlers safe to retry: repeated events return the saved response instead of running again. |
 | [`batch`](./batch) | Processes SQS, Kinesis and DynamoDB Streams batches record by record and reports partial failures, so only failed records are retried. |
 
+**Example:** [`examples/sqs-orders`](./examples/sqs-orders) is a complete, deployable SQS → Lambda → DynamoDB project (Terraform included) that charges each order at most once. It doubles as the end-to-end test against real AWS.
+
 ## Idempotency
 
 ```sh
@@ -91,6 +93,8 @@ lambda.Start(func(ctx context.Context, o Order) (Receipt, error) {
 	return r, err
 })
 ```
+
+This stops the immediate retry, but it isn't a full guarantee. The record stays `INPROGRESS` only until the invocation's deadline, so a separate duplicate of the same event arriving after that runs the handler again. The library can't close this gap, because the store is the thing that failed. Alert on that log line, and pass an idempotency key to downstream APIs that accept one, so they deduplicate too.
 
 ### Options
 
