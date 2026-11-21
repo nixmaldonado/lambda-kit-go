@@ -9,6 +9,7 @@ This is a community project. It is not affiliated with or endorsed by AWS.
 | Package | What it does |
 |---|---|
 | [`idempotency`](./idempotency) | Makes handlers safe to retry: repeated events return the saved response instead of running again. |
+| [`batch`](./batch) | Processes SQS, Kinesis and DynamoDB Streams batches record by record and reports partial failures, so only failed records are retried. |
 
 ## Idempotency
 
@@ -137,6 +138,56 @@ The function needs `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:DeleteIt
 - Responses are saved as JSON. Unexported fields are not saved, so a replayed response is missing them.
 - Empty key data (`null`, `""`, `{}`, `[]`) returns `ErrMissingKey`, and the handler does not run.
 - If the handler errors or panics, the record is deleted so a retry can run. This also happens when the invocation's context was cancelled: saving and cleanup use a context that ignores cancellation, with a 5 second timeout.
+
+## Batch processing
+
+When SQS, Kinesis or DynamoDB Streams trigger a Lambda, the Lambda service polls the source and invokes your function with a **batch** of records. By default, if one record fails, the whole batch is retried, including the records that succeeded. `batch` processes records one at a time and tells Lambda which ones failed.
+
+```go
+lambda.Start(batch.SQS(func(ctx context.Context, msg events.SQSMessage) error {
+	var o Order
+	if err := json.Unmarshal([]byte(msg.Body), &o); err != nil {
+		return err
+	}
+	return charge(ctx, o)
+}))
+```
+
+> **Turn on `ReportBatchItemFailures`** in the event source mapping (`FunctionResponseTypes: [ReportBatchItemFailures]`). Without it, Lambda ignores the response: the batch counts as a success and failed records are **deleted** from the queue.
+
+| Source | On a failed record |
+|---|---|
+| `batch.SQS`, standard queue | Keeps going and reports every failed message. |
+| `batch.SQS`, FIFO queue (detected from the ARN) | Stops and reports that message and all later ones, so order is kept. |
+| `batch.Kinesis`, `batch.DynamoDB` | Stops and reports that record. Lambda retries the stream from it, in order. |
+
+Other behavior:
+
+- A record that panics counts as failed; the rest of the batch still runs.
+- If no record succeeds, the handler also returns an error matching `batch.ErrAllFailed`, so Lambda counts a failed invocation and backs off.
+- If the context is cancelled (the invocation is about to time out), the remaining records are reported as failed without being processed.
+- Use `batch.OnError(func(ctx, id, err))` to log failures; the response only carries record IDs.
+
+### Batch + idempotency
+
+SQS can deliver a message more than once, and producers can publish duplicates. Combine both packages so each record runs at most once:
+
+```go
+idem := idempotency.New(store, idempotency.WithKeyPrefix("charge"))
+
+lambda.Start(batch.SQS(func(ctx context.Context, msg events.SQSMessage) error {
+	var o Order
+	if err := json.Unmarshal([]byte(msg.Body), &o); err != nil {
+		return err
+	}
+	_, err := idempotency.Do(ctx, idem, o.ID, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, charge(ctx, o)
+	})
+	return err
+}))
+```
+
+Key on a business ID such as the order ID, not `msg.MessageId`. The message ID stays the same when SQS redelivers a message, but a producer that publishes twice creates two different message IDs. A duplicate that arrives while the first copy is still running gets `ErrInProgress`, is reported as failed, and replays the saved result when SQS redelivers it.
 
 ## Development
 
