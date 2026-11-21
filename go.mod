@@ -2,9 +2,8 @@ module github.com/nixmaldonado/lambda-kit-go
 
 go 1.24
 
-toolchain go1.24.4
-
 require (
+	github.com/aws/aws-lambda-go v1.54.0
 	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.21.3
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.74.1
